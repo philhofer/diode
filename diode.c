@@ -1,4 +1,7 @@
 #define _GNU_SOURCE
+#include <sys/types.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
 #include <unistd.h>  /* ssize_t */
 #include <fcntl.h>   /* fcntl, O_XXX */
 #include <stdint.h>  /* size_t, uint32_t */
@@ -7,6 +10,11 @@
 #include <stdio.h> /* perror() */
 #include <errno.h> /* errno */
 #include <time.h>  /* struct timespec */
+
+int epoll_create1(int);
+typedef int64_t loff_t;
+ssize_t splice();
+int pipe2(int pipefd[2], int flags);
 
 #define __SYSERR(FL, LN, FN) perror(#FL " " #LN FN)
 #define SYSERR(FN) __SYSERR(__FILE__, __LINE__, FN)
@@ -313,8 +321,9 @@ static int perform_fsync(io_req_t *irq) {
 
 /* state of io_ctx_t */
 enum {
-  IO_STATE_HDR,
-  IO_STATE_BODY
+  IO_STATE_HDR,  /* reading request */
+  IO_STATE_BODY, /* reading/writing body */
+  IO_STATE_RESP  /* rdbuf contains response status */
 };
 
 typedef struct {
@@ -337,5 +346,148 @@ typedef struct {
 #define BITSLAB_SIZE 128
 #include "bitslab.h"
 
+static ctxmm_t ctx_heap;
 
- 
+static io_ctx_t *get_ctx(void) {
+  return ctx_malloc(&ctx_heap);
+}
+
+static void free_ctx(io_ctx_t *ctx) {
+  ctx_free(&ctx_heap, ctx);
+  return;
+}
+
+static int epollfd; /* epoll fd */
+static io_queue_t queue; /* thread pool */
+static int lsock; /* listen socket */
+
+static void init(void) {
+  __builtin_memset(&ctx_heap, 0, sizeof(ctx_heap));
+  epollfd = epoll_create1(EPOLL_CLOEXEC);
+  if (epollfd == -1) {
+    perror("epoll");
+    _exit(1);
+  }
+
+  if (queue_init(&queue) == -1) {
+    perror("queue init");
+    _exit(1);
+  }
+
+  for (int i=0; i<BITSLAB_SIZE; ++i) {
+    int pipefd[2];
+    io_ctx_t *ctx = &ctx_heap.mem[i];
+    if (pipe2(pipefd, O_CLOEXEC) == -1) {
+      perror("cloexec");
+      _exit(1);
+    }
+    ctx->req.parent = &queue;
+    ctx->req.pipe_rd = pipefd[0];
+    ctx->req.pipe_wr = pipefd[1];
+  }
+
+  /* TODO: set up socket */
+  /* if ((lsock = socket(AF_INET6, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0)) == -1) {
+   *  perror("socket");
+   * _exit(1);
+   * }
+   */
+
+   /* add listener socket to epoll  */
+   struct epoll_event ev;
+   ev.events = EPOLLIN | EPOLLHUP | EPOLLERR  | EPOLLET;
+   ev.data.ptr = NULL;
+   if (epoll_ctl(epollfd, EPOLL_CTL_ADD, lsock, &ev) == -1) {
+    perror("epoll_ctl");
+    _exit(1);
+   }
+   
+   /* add io completion pipe to epoll */
+   ev.data.ptr = (void *)queue;
+   if (epoll_ctl(epollfd, EPOLL_CTL_ADD, queue.r_fd, &ev) == -1) {
+    perror("epoll_ctl");
+    _exit(1);
+   }
+
+  return;
+}
+
+static void uninit(void) {
+  queue_destroy(&queue);
+  close(epollfd);
+}
+
+enum {
+  REASON_IO_COMPLETE, /* i/o is complete, try to finish up */
+  REASON_COPY_READY   /* socket/pipe is available for i/o */
+};
+
+static void ready(io_ctx_t *ctx, int reason, uint32_t events) {
+  switch (reason) {
+  case REASON_IO_COMPLETE:
+    if (events&EPOLLOUT) {
+      try_sock_write(ctx);
+    }
+    break;
+  case REASON_COPY_READY:
+    if (events&EPOLLOUT) {
+      try_sock_write(ctx);
+    }
+    if (events&EPOLLIN) {
+      try_sock_read(ctx);
+    }
+    break;
+  default:
+    assert(false);
+  }
+  return;
+}
+
+int main(void) {
+  init();
+
+  for (;;) {
+    struct epoll_event evlist[64];
+    int nev = epoll_wait(epollfd, evlist, 64, -1);
+    if (nev == -1) {
+      perror("epoll_wait");
+      _exit(1);
+    }
+
+  ploop:
+    for (int i=0; i < nev; ++i) {
+      struct epoll_event ev = evlist[i];
+      
+      if (ev.data.ptr == NULL) {
+	/* listener event */
+	/* TODO */
+	
+      } else if (ev.data.ptr == &queue) {
+	/* i/o completion */
+
+	io_ctx_t *ctx;
+	switch (read(queue.r_fd, &ctx, sizeof(ctx))) {
+	case sizeof(ctx):
+	  ready(ctx, REASON_IO_COMPLETE, ev.events);
+	case -1:
+	  if errno == EAGAIN {
+	      continue ploop
+	    }
+	default:
+	  assert(false && "strange read");
+	}
+	
+      } else {
+	/* socket or pipe r/w availability */
+
+	io_ctx_t *ctx = (io_ctx_t *)ev.data.ptr;
+	ready(ctx, REASON_COPY_READY, ev.events);
+	
+      }
+      
+    }
+    
+  }
+  
+  uninit();
+}
